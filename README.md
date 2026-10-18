@@ -1,0 +1,183 @@
+<div align="center">
+
+# SignBridge — Sign Language Platform
+
+**Real-time sign-language translation for the browser.** Sign ↔ text ↔ audio, with live video rooms, a 3D avatar and an interactive learning mode. Supports **Arabic Sign Language (33 classes)** and **American Sign Language (28 classes)**.
+
+[![CI](https://github.com/bashar-11/SignBridge/actions/workflows/ci.yml/badge.svg)](https://github.com/bashar-11/SignBridge/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.110-009688?logo=fastapi)](https://fastapi.tiangolo.com)
+
+</div>
+
+---
+
+> **بالعربية باختصار:** منصة ويب لترجمة لغة الإشارة لحظيًا (إشارة ↔ نص ↔ صوت) supporting **العربية (33 كلاس)** و**الإنجليزية (28 كلاس)**. تعتمد على MediaPipe لاستخراج 21 نقطة من اليد، وموديلات BiLSTM مدرّبة على TensorFlow Lite، مع نظام ثقة متعدد الطبقات يقلّل الأخطاء الشائعة. تشمل المنصة غرف محادثة مباشرة عبر WebRTC، وأفاتار ثلاثي الأبعاد، ووضع تعلّم واختبار تفاعلي، والعمل كتطبيق ويب تقدّمي (PWA). التوثيق الكامل بالعربية في [PROJECT_DOC.md](PROJECT_DOC.md).
+
+## What it does
+
+| Feature | Description |
+|---|---|
+| **Live translation** | Point a camera at a signer and get letters as they are produced. Arabic or English. |
+| **Sign Rooms** | Direct video calls between two people, with WebRTC and WebSocket signalling. |
+| **Text to Sign** | Type text and watch it rendered as sign on the 3D avatar. |
+| **Learn & Quiz** | Interactive practice mode with feedback on letter accuracy. |
+| **History & Stats** | Session history and performance statistics. |
+| **PWA** | Installable, with a service worker and offline shell. |
+
+## The AI pipeline
+
+```
+Camera (640x480)
+    |
+MediaPipe Hands  (modelComplexity 0, ~45 ms/frame)
+    |
+21 landmarks x (x, y, z) = 63 values
+    |   left-hand x mirrored so both hands share one coordinate frame
+    |
+sliding buffer = 23 frames   (inference starts at MIN_FILL = 8)
+    |
+POST /predict { sequence, language }
+    |
+TFLite interpreter  (guarded by inference_lock so two requests cannot race)
+    |
+softmax -> argmax -> letter + confidence + top-3
+    |
+stability filter (front end): the same letter for N consecutive frames above
+the confidence gate, plus a latch that holds the final letter until the hand
+leaves the gesture
+    |
+letter committed to the sentence once per sign
+```
+
+Two models ship with the project:
+
+| Model | Language | Classes | Size |
+|---|---|---|---|
+| `arsl_model.tflite` | Arabic | 33 (the Arabic alphabet plus `DEL` and `SPACE`) | 3.9 MB |
+| `asl_model.tflite` | English | 28 (`A`–`Z` plus `DEL` and `SPACE`) | 3.9 MB |
+
+Both use **Select-TF / Flex ops** because of the BiLSTM layers, so they cannot
+be loaded by the small `tflite-runtime` package. The project therefore uses
+full `tensorflow-cpu`, which ships the Flex delegate.
+
+## The part that actually matters
+
+A letter-by-letter sign classifier is easy. Making one usable is not: it
+mis-fires constantly on transitions between visually similar letters. Most of
+the engineering here sits in the layers *above* the model.
+
+| Layer | What it does |
+|---|---|
+| `SPEED_PRESETS` | `smooth` / `fast` / `turbo` — trades frame sampling rate for accuracy. |
+| `confGate` | Confidence gate at 50% / 60% / 80%. Without it the output accepts almost anything. |
+| Stability filter | `newStab` / `latch` / `addRelease`. A letter is only emitted once and stays stable until the hand *physically leaves* the gesture — a new position, a confidence drop, or the hand leaving the frame. |
+| Sign-boundary dropping | `SIGN_BOUNDARY_FRAMES = 3` delays release at the 23-frame window boundary so gestures that straddle the sliding window are not truncated. Rapid gestures get the window advanced by the full stride instead. |
+| `modelComplexity` gating | Runs the light MediaPipe model, drops to the heavy one only when fingers are extended, then back to light once steady. Keeps landmark precision for `ج`/`ح`/`خ` and `د`/`ذ` without paying the cost every frame. |
+| `jhkArbitrate` | Engineering heuristic for the ج / ح / خ cluster: خ gets a dampened base of ح plus a smoothed forward shift, ج is the same with a negative shift. Distance from the trajectory mean and direction decide, and it never modifies or discards the model output — it only shrinks the top-3 gap. |
+| `CONFUSABLE_AR` | The mutually confusable set is complete: خ (whose base form often *is* ح), plus ع/غ, ض/ص, and ال/لا. Confused letter pairs are also graphemes, not standalone letters. |
+| Flip-window reference | Handedness normalisation against a reference captured during the flip window. |
+
+## Architecture
+
+```
+app.html              Full interface (React 18 + Three.js)
+                      JSX source inline in <script id="app-source">
+app.compiled.js       Pre-built bundle, generated by build.ps1
+Server.py             FastAPI: TFLite inference, WebRTC signalling, static files
+arsl_model.tflite     Arabic model, 33 classes
+asl_model.tflite      English model, 28 classes
+```
+
+**Why a single HTML file and a prebuilt bundle?** The deployment target is a
+free-tier container with 512 MB, so the constraint that shaped the architecture
+was memory and load time, not developer convenience:
+
+- **Free-tier hosting** — the Flex ops require `tensorflow-cpu`, which is large.
+- **Same-origin API** — the page calls the backend on the same domain, so it
+  works on any host without CORS configuration.
+- **Inference on the server** — keeps it working on low-end phones, and the
+  models never ship to the client.
+- **Prebuilt bundle** — avoids running Babel in the browser, which cuts roughly
+  3 MB of payload and makes first paint much faster. Babel stays available as a
+  development-only fallback.
+
+## Running it locally
+
+**Requirements:** Python 3.11 and ~3 GB of disk for TensorFlow.
+
+```bash
+git clone https://github.com/bashar-11/SignBridge.git
+cd SignBridge
+
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+
+pip install -r requirements.txt
+
+# Build the JS bundle from the inline JSX source (requires pwsh / PowerShell)
+./build.ps1
+
+python Server.py
+```
+
+Then open `http://localhost:8010`. Set `PORT` to change it. The `/health`
+endpoint reports whether the models loaded and which engine is active — models
+load in a background thread so the port binds immediately rather than blocking
+on ~8 MB of weights.
+
+`/health`, `/models` and `/api/ice-servers` are useful for checking a deployment.
+
+## Deploying
+
+**Render (free tier)** — the repository ships a Blueprint:
+
+1. Push the repository to GitHub.
+2. On render.com choose **New → Blueprint** and select the repository.
+3. Set the prompted secrets in the dashboard: `TURN_URL`, `TURN_USERNAME`,
+   `TURN_CREDENTIAL`, `MAX_ROOM_SIZE`, `ERR_RATE_LIMIT`.
+
+The `TURN_*` values are needed because WebRTC cannot establish peer connections
+through strict NATs without a relay. They use `sync: false`, so Render prompts
+for them and they are never stored in the repository.
+
+**Docker**
+
+```bash
+docker build -t signbridge .
+docker run -p 8000:8000 signbridge
+```
+
+The image sets `PORT=8000`; override it to change the published port.
+
+## Tests
+
+```bash
+node tests/ui.smoke.test.js              # UI smoke test (jsdom)
+node tests/verify.responsive.test.js     # responsive layout and a11y
+python tests/ws.test.py                  # WebSocket integration, needs the server up
+```
+
+`tests/run.ps1` runs the full suite. CI builds the bundle, syntax-checks both
+entrypoints, then runs the smoke, responsive and WebSocket integration tests.
+
+## Documentation
+
+- [`PROJECT_DOC.md`](PROJECT_DOC.md) — the full design document, in Arabic.
+  Covers the architecture rationale, the AI pipeline, the reliability layers,
+  every screen, the three-tier testing plan, and a roadmap.
+- [`README_DEPLOY.md`](README_DEPLOY.md) — deployment notes.
+
+## Known limitations
+
+- Single-process in-memory room state, so it scales to one instance. Horizontal
+  scaling needs shared state for the WebSocket rooms.
+- Accuracy is bounded by MediaPipe hand tracking. Hands that overlap or leave
+  the frame are the main failure mode.
+- The letter classifiers are per-letter; there is no word- or phrase-level
+  language model over the recognised letters yet.
+
+## License
+
+[MIT](LICENSE) © 2026 Bashar Sayed
